@@ -1,0 +1,631 @@
+---
+title: "Cherry Blossom Prediction Competition"
+author: "Spencer Retcher"
+format: pdf
+editor: visual
+---
+
+# Importing Tidyverse
+
+```{r}
+#| message: false
+library(tidyverse)
+library(caret)
+library(openmeteo)
+library(readr)
+library(kernlab)
+```
+
+# Measuring Bloom Dates for New York City
+
+The peak bloom dates for Yoshino cherry trees from 2019 - 2023 were determined by using data from the *USA National Phenology Network* and by following this method:
+
+1.  The bloom date for each tree was measured as the average date between the day the volunteer first noticed open flowers and the number of days since the prior observation.
+    i)  If a volunteer noticed open flowers on a certain day, that does not mean that the bloom date was that day. The bloom date could have taken place anytime between these two dates, so this average attempts to minimize potential volunteer error.
+2.  The peak bloom dates for New York City in 2019-2023 were the earliest bloom dates observed among Yoshino cherry trees during those years.
+
+```{r}
+#| message: false
+nyc <- read_csv("data/USA-NPN_individual_phenometrics_data.csv") |>
+       filter(Site_ID == 32789,Species_ID == 228) |>
+       mutate(NumDays_Since_Prior_No = if_else(NumDays_Since_Prior_No == -9999,
+                                               0,
+                                               NumDays_Since_Prior_No))
+
+nyc_data <- nyc |>
+  mutate(
+    year = First_Yes_Year,
+    bloom_date = as.Date(paste(First_Yes_Year, First_Yes_Month, First_Yes_Day, sep = "-")) - NumDays_Since_Prior_No / 2,
+    bloom_doy = floor(First_Yes_DOY - (NumDays_Since_Prior_No / 2))
+  ) |>
+  group_by(year) |>
+  summarise(bloom_date = min(bloom_date),
+            bloom_doy = min(bloom_doy),
+            .groups = "drop") |>
+  mutate(
+    location = 'newyorkcity',
+    lat = 40.73082,
+    long = -73.99733,
+    alt = 5,
+  ) |>
+  select(location, lat, long, alt, year, bloom_date, bloom_doy)
+
+nyc_data
+```
+
+# Historical Bloom Dates
+
+The tibble `historical_bloom_dates` contains past peak bloom dates and information about the five locations of interest:
+
+-   Kyoto (Japan)
+-   Liestal-Weideli (Switzerland)
+-   Washington, D.C. (USA)
+-   Vancouver, BC (Canada)
+-   New York City, NY (USA)
+
+```{r}
+#| message: false
+historical_bloom_dates <- tibble(read_csv("data/washingtondc.csv") |>
+  bind_rows(read_csv("data/liestal.csv")) |>
+  bind_rows(read_csv("data/kyoto.csv")) |> 
+  bind_rows(read_csv("data/vancouver.csv")) |>
+  bind_rows(nyc_data))
+
+historical_bloom_dates
+```
+
+# Open-Meteo API
+
+Data for this project was collected from the *Open-Meteo API*, which can be accessed from R by using the library `openmeteo` (API key not required).Using this API, we will retrieve hourly and daily weather conditions from 1940 to the present day for each of our five locations. Later on, we will forecast the same weather conditions 16 days into the future for each of our locations, which we will use to help us make our 2024 peak bloom predictions.
+
+Note: The API can be slow and allows around 10-15 requests per day. I will convert most of these requests to csv files and save them to the folders `data/hourly_data`, `data/daily_data`, and `data/forecast_data` to make the report easier to reproduce.
+
+```{r}
+
+# Used to get daily weather data for a location
+get_daily_data <- function(lat, long, date_min, date_max, elements) {
+  weather_history(
+    location = c(lat, long),
+    start = date_min,
+    end = date_max,
+    daily = elements
+    ) 
+}
+
+# Used to get hourly weather data for a location
+get_hourly_data <- function(lat, long, date_min, date_max, elements) {
+  weather_history(
+    location = c(lat, long),
+    start = date_min,
+    end = date_max,
+    hourly = elements
+    ) 
+}
+```
+
+# Accumulative Growing Degree Days
+
+Growing degree day
+
+:   A measurement of heat accumulation which can be used to predict the development rates of plants.
+
+`add_gdd()` calculates the growing degree day for each day by using the
+
+1.  Daily maximum temperature
+2.  Daily minimum temperature
+3.  Base Temperature of 10°C $$
+    GDD = \frac{(T_{max} + T_{min})}{2} - 10^\circ C
+    $$
+
+If the average daily temperature is less than the base temperature, the growing degree day for that day is zero.
+
+`get_agdd()` filters the daily weather data for a particular year and location and sums up the growing degree days for that year between January 1st to the bloom_date.
+
+```{r}
+add_gdd <- function(daily_temp_data) {
+  daily_temp_data |>
+      mutate(
+        year = year(date),
+        growing_degree_day = 
+          ((daily_temperature_2m_max + daily_temperature_2m_min) / 2) - 10
+      ) |>
+    mutate(growing_degree_day = case_when(growing_degree_day < 0 ~ 0, 
+                                          .default = growing_degree_day)) |>
+    relocate(year, .after = date)
+}
+
+
+get_agdd <- function(place, year, bloom_date) {
+  
+  data <- daily_data %>%
+          filter(location == place)
+
+
+  date_min = as.Date(paste(year, "-01-01",sep = ""),format = "%Y-%m-%d")
+
+  check_date_range <- data %>%
+    filter(date >= date_min & date <= bloom_date)
+  
+  if (nrow(check_date_range) == 0) {
+    return(NA)
+  }
+  
+  
+  check_date_range |>
+    group_by(year) |>
+    summarise(agdd = sum(growing_degree_day, na.rm = TRUE)) |> 
+    pull(agdd)
+}
+```
+
+# Total Sunshine Duration
+
+Sunshine duration
+
+:   The number of seconds of sunshine per day which is determined by calculating direct normalized irradiance exceeding 120 W/m².
+
+`sunshine_to_hours()` converts the sunshine duration of each day into hours.
+
+`get_sunshine()` filters the daily weather data for a particular year and location and sums up the number of hours of sunshine duration for that year between January 1st to the bloom_date.
+
+```{r}
+sunshine_to_hours <- function(sunshine_data) {
+    sunshine_data |>
+    mutate(daily_sunshine_duration = daily_sunshine_duration / 3600)
+}
+
+get_sunshine <- function(place, year, bloom_date) {
+  
+  data <- daily_data %>%
+          filter(location == place)
+
+  date_min = as.Date(paste(year, "-01-01",sep = ""),format = "%Y-%m-%d")
+
+  check_date_range <- data %>%
+    filter(date >= date_min & date <= bloom_date)
+  
+  if (nrow(check_date_range) == 0) {
+    return(NA)
+  }
+  
+  check_date_range |>
+    group_by(year) |>
+    summarise(sunshine_duration = sum(daily_sunshine_duration, na.rm = TRUE)) |> 
+    pull(sunshine_duration)
+}
+```
+
+# Total Precipitation
+
+Precipitation
+
+:   The amount of rain, showers, and snowfall for a day measured in millimeters.
+
+`get_precip()` filters the daily weather data for a particular year and location and sums up the amount of precipitation for that year between January 1st to the bloom_date.
+
+```{r}
+get_precip <- function(place, year, bloom_date) {
+  
+  data <- daily_data %>%
+          filter(location == place)
+
+  date_min = as.Date(paste(year, "-01-01",sep = ""),format = "%Y-%m-%d")
+
+  check_date_range <- data %>%
+    filter(date >= date_min & date <= bloom_date)
+  
+  if (nrow(check_date_range) == 0) {
+    return(NA)
+  }
+  
+  
+  check_date_range |>
+    group_by(year) |>
+    summarise(total_precipitation = sum(daily_precipitation_sum, na.rm = TRUE)) |> 
+    pull(total_precipitation)
+  
+}
+```
+
+# Chill Hours
+
+Chill hours
+
+:   The number of hours in the winter that a plant spends exposed to certain temperatures.
+
+For this project, chill hours is the number of hours between 0°C to 7°C from November to February.
+
+`get_chills()` filters the hourly weather data for a particular year and location and sums up the number of chill hours in the winter for that year between November to Feburary.
+
+```{r}
+add_chill <- function(data) {
+  data |> 
+    mutate(
+      chill_hour = case_when(
+        hourly_temperature_2m >= 0 & hourly_temperature_2m <= 7 ~ 1,
+        .default = 0
+      ),
+      date = as.Date(datetime),
+      year = as.integer(format(datetime, "%Y")),
+      month = as.integer(strftime(date, '%m')) %% 12,
+      # make December "0"
+      year = if_else(month == 0 | month == 11, year + 1L, year)
+    ) |>
+    filter(month %in% c(11, 0, 1, 2)) |>
+    group_by(year, location) |>
+    summarize(chill_hours = sum(chill_hour))
+}
+
+
+
+get_chill <- function(place, chill_year) {
+  
+  data <- hourly_data %>%
+          filter(location == place)
+  
+  check_date_range <- data %>%
+    filter(year == chill_year)
+  
+  if (nrow(check_date_range) == 0) {
+    return(NA)
+  }
+  
+    data |>
+    filter(year == chill_year) |>
+    pull(chill_hours)
+}
+```
+
+# Forecasting Weather Data
+
+The *Open-Meteo API* can forecast the daily weather conditions stated above 16 days into the future. These forecasts were downloaded for each location from https://open-meteo.com/ and stored in csv files.
+
+We do not need to forecast hourly temperature data to calculate this winter's chill hours since the competition ends on the last day of winter and we already have a good estimate of the chill hours.
+
+```{r}
+washingtondc_forecast_daily_data <- read_csv("data/forecast_data/open-meteo-38.89N77.03W1m.csv", col_types = cols(time = col_date(format = "%Y-%m-%d")), skip = 2) |>
+  rename(date = time, 
+         daily_temperature_2m_max = `temperature_2m_max (°C)`,
+         daily_temperature_2m_min = `temperature_2m_min (°C)`, 
+         daily_sunshine_duration = `sunshine_duration (s)`,
+         daily_precipitation_sum = `precipitation_sum (mm)`) |>
+  mutate(location = "washingtondc")
+
+
+liestal_forecast_daily_data <- read_csv("data/forecast_data/open-meteo-47.48N7.74E344m.csv", col_types = cols(time = col_date(format = "%Y-%m-%d")), skip = 2) |>
+  rename(date = time, 
+         daily_temperature_2m_max = `temperature_2m_max (°C)`,
+         daily_temperature_2m_min = `temperature_2m_min (°C)`,
+         daily_sunshine_duration = `sunshine_duration (s)`,
+         daily_precipitation_sum = `precipitation_sum (mm)`) |>
+  mutate(location = "liestal")
+  
+
+
+kyoto_forecast_daily_data <- read_csv("data/forecast_data/open-meteo-35.00N135.69E31m.csv", col_types = cols(time = col_date(format = "%Y-%m-%d")), skip = 2) |>
+  rename(date = time, 
+         daily_temperature_2m_max = `temperature_2m_max (°C)`,
+         daily_temperature_2m_min = `temperature_2m_min (°C)`,
+         daily_sunshine_duration = `sunshine_duration (s)`,
+         daily_precipitation_sum = `precipitation_sum (mm)`) |>
+  mutate(location = "kyoto")
+ 
+
+vancouver_forecast_daily_data <- read_csv("data/forecast_data/open-meteo-49.23N123.18W28m.csv", col_types = cols(time = col_date(format = "%Y-%m-%d")), skip = 2) |>
+  rename(date = time, 
+         daily_temperature_2m_max = `temperature_2m_max (°C)`,
+         daily_temperature_2m_min = `temperature_2m_min (°C)`, 
+         daily_sunshine_duration = `sunshine_duration (s)`, 
+         daily_precipitation_sum = `precipitation_sum (mm)`) |>
+  mutate(location = "vancouver")
+
+
+
+newyorkcity_forecast_daily_data <- read_csv("data/forecast_data/open-meteo-40.74N73.98W14m.csv", col_types = cols(time = col_date(format = "%Y-%m-%d")), skip = 2) |>
+  rename(date = time, 
+         daily_temperature_2m_max = `temperature_2m_max (°C)`,
+         daily_temperature_2m_min = `temperature_2m_min (°C)`,
+         daily_sunshine_duration = `sunshine_duration (s)`, 
+         daily_precipitation_sum = `precipitation_sum (mm)`) |>
+  mutate(location = "newyorkcity")
+
+bind_rows(washingtondc_forecast_daily_data, 
+          liestal_forecast_daily_data, 
+          kyoto_forecast_daily_data, 
+          vancouver_forecast_daily_data, 
+          newyorkcity_forecast_daily_data)
+```
+
+# Combining and Transforming Daily Weather Data and Forecast Data
+
+1.  The *Open-Meteo API* was used to retrieve the daily maximum temperature, daily minimum temperature, daily sunshine duration, and daily precipitation for all days from January 1, 1940 to Yesterday for each location.
+2.  All of the daily weather data was joined with the 16 day weather forecast for each location and placed into `daily_data`.
+    i)  This means if we submit our project on the last day of the competition, we will have the daily weather data from January 1, 1940 to March 15, 2024.
+3.  `daily_data` is then transformed.
+    i)  The sunshine duration for each day is converted to hours.
+    ii) The growing degree days are added for each day.
+
+```{r}
+#| message: false
+# washingtondc_daily_data <- get_daily_data(lat = 38.8853, 
+#                                           long = -77.0386, 
+#                                           date_min = "1940-01-01",
+#                                           date_max = Sys.Date() - 1,
+#                                           elements = c("temperature_2m_max","temperature_2m_min", "sunshine_duration", "precipitation_sum")) %>%
+#                                           mutate(location = "washingtondc")
+# write.csv(washingtondc_daily_data, file = "washingtondc_daily_data.csv", row.names = TRUE)
+
+washingtondc_daily_data <- read_csv("data/daily_data/washingtondc_daily_data.csv")
+
+```
+
+```{r}
+#| message: false
+# liestal_daily_data <- get_daily_data(lat = 47.4814, 
+#                                      long =7.730519 ,
+#                                      date_min = "1940-01-01",
+#                                      date_max = Sys.Date() - 1,
+#                                      elements = c("temperature_2m_max","temperature_2m_min","sunshine_duration", "precipitation_sum"))  %>%
+#                                      mutate(location = "liestal")
+# write.csv(liestal_daily_data, file = "liestal_daily_data.csv", row.names = TRUE)
+
+liestal_daily_data <- read_csv("data/daily_data/liestal_daily_data.csv")
+
+```
+
+```{r}
+#| message: false
+
+# kyoto_daily_data <- get_daily_data(lat = 35.0120,
+#                                    long = 135.6761,
+#                                    date_min = "1940-01-01",
+#                                    date_max = Sys.Date() - 1,
+#                                    elements = c("temperature_2m_max","temperature_2m_min", "sunshine_duration","precipitation_sum"))  %>%
+#                                    mutate(location = "kyoto")
+# write.csv(kyoto_daily_data, file = "kyoto_daily_data.csv", row.names = TRUE)
+
+kyoto_daily_data <- read_csv("data/daily_data/kyoto_daily_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# vancouver_daily_data <- get_daily_data(lat = 49.2237,
+#                                        long = -123.1636,
+#                                        date_min = "1940-01-01", 
+#                                        date_max = Sys.Date() - 1,
+#                                        elements = c("temperature_2m_max","temperature_2m_min", "sunshine_duration", "precipitation_sum"))  %>%
+#                                        mutate(location = "vancouver")
+# write.csv(vancouver_daily_data, file = "vancouver_daily_data.csv", row.names = TRUE)
+
+vancouver_daily_data <- read_csv("data/daily_data/vancouver_daily_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# newyorkcity_daily_data <- get_daily_data(lat = 40.73040 , 
+#                                          long = -73.99809,
+#                                          date_min = "1940-01-01", 
+#                                          date_max = Sys.Date() - 1,
+#                                          elements = c("temperature_2m_max","temperature_2m_min", "sunshine_duration","precipitation_sum")) %>%
+#                                          mutate(location = "newyorkcity")
+
+# write.csv(newyorkcity_daily_data, file = "newyorkcity_daily_data.csv", row.names = TRUE)
+
+newyorkcity_daily_data <- read_csv("data/daily_data/newyorkcity_daily_data.csv")
+
+```
+
+```{r}
+daily_data = bind_rows(washingtondc_daily_data, liestal_daily_data, kyoto_daily_data, vancouver_daily_data, newyorkcity_daily_data, washingtondc_forecast_daily_data, liestal_forecast_daily_data, kyoto_forecast_daily_data, vancouver_forecast_daily_data, newyorkcity_forecast_daily_data) |>
+  add_gdd() |>
+  sunshine_to_hours()
+
+daily_data
+```
+
+# Hourly Weather Data
+
+The *Open-Meteo API* was used to retrieve the hourly temperatures for all days from January 1, 1940 to Yesterday for each location.
+
+These hourly temperatures were joined together, placed into `hourly_data`, and than the chill hours for each hour were calculated.
+
+```{r}
+#| message: false
+# 
+# washingtondc_hourly_data <- get_hourly_data(lat = 38.8853, 
+#                                             long = -77.0386, 
+#                                             date_min = "1940-01-01", 
+#                                             date_max = Sys.Date()- 1,
+#                                             elements = c("temperature_2m"))  %>%
+#                                             mutate(location = "washingtondc")
+# write.csv(washingtondc_hourly_data, file = "washingtondc_hourly_data.csv", row.names = TRUE)
+
+washingtondc_hourly_data <- read_csv("data/hourly_data/washingtondc_hourly_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# liestal_hourly_data <- get_hourly_data(lat = 47.4814, 
+#                                        long =7.730519 , 
+#                                        date_min = "1940-01-01",
+#                                        date_max = Sys.Date() - 1,
+#                                        elements = c("temperature_2m"))  %>%
+#                                        mutate(location = "liestal")
+
+# write.csv(liestal_hourly_data, file = "liestal_hourly_data.csv", row.names = TRUE)
+
+liestal_hourly_data <- read_csv("data/hourly_data/liestal_hourly_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# kyoto_hourly_data <- get_hourly_data(lat = 35.0120, 
+#                                      long = 135.6761, 
+#                                      date_min = "1940-01-01", 
+#                                      date_max = Sys.Date() - 1,
+#                                      elements = c("temperature_2m" ))  %>%
+#                                      mutate(location = "kyoto")
+# write.csv(kyoto_hourly_data, file = "kyoto_hourly_data.csv", row.names = TRUE)
+
+kyoto_hourly_data <- read_csv("data/hourly_data/kyoto_hourly_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# vancouver_hourly_data <- get_hourly_data(lat = 49.2237 , 
+#                                          long = -123.1636 ,
+#                                          date_min = "1940-01-01", 
+#                                          date_max = Sys.Date() - 1,
+#                                          elements = c("temperature_2m" ))  %>%
+#                                          mutate(location = "vancouver")
+# write.csv(vancouver_hourly_data, file = "vancouver_hourly_data.csv", row.names = TRUE)
+
+vancouver_hourly_data<- read_csv("data/hourly_data/vancouver_hourly_data.csv")
+
+```
+
+```{r}
+#| message: false
+# 
+# newyorkcity_hourly_data <- get_hourly_data(lat = 40.73040 ,
+#                                            long = -73.99809,
+#                                            date_min = "1940-01-01", 
+#                                            date_max = Sys.Date() - 1,
+#                                            elements = c("temperature_2m" )) %>%
+#                                            mutate(location = "newyorkcity")
+# write.csv(newyorkcity_hourly_data, file = "newyorkcity_hourly_data.csv", row.names = TRUE)
+
+newyorkcity_hourly_data <- read_csv("data/hourly_data/newyorkcity_hourly_data.csv")
+
+```
+
+```{r}
+hourly_data = bind_rows(washingtondc_hourly_data,liestal_hourly_data,kyoto_hourly_data,vancouver_hourly_data,newyorkcity_hourly_data) |>
+  add_chill()
+
+hourly_data
+```
+
+# Creating the Complete Dataset
+
+We have all the daily and hourly weather data for each of our locations from January 1, 1940 to March 15, 2024.
+
+We then use `rowise()` and `mutate()` to essentially take each row of data in `historical_bloom_dates` and compute the aggregations for that year.
+
+For each year and location in `historical_bloom_dates`, we calculate:
+
+1. the number of chill hours between November and February. 
+2. the number of sunshine hours between January 1st to the bloom_date. 
+3. the number of growing degree days between January 1st to the bloom_date. 
+4. the amount of precipitation between January 1st to the bloom_date.
+
+```{r}
+complete_dataset <- historical_bloom_dates %>%
+  filter(year >=1940) |>
+  rowwise() |>
+  mutate(chill_hours = get_chill(location,year),
+         accumulative_growing_degree_days = get_agdd(location, year, bloom_date),
+         total_sunshine_duration = get_sunshine(location,year,bloom_date),
+         total_precipitation = get_precip(location, year, bloom_date)
+         )
+
+complete_dataset
+```
+
+# Bayesian Regularized Neural Network
+
+We did a 70/30 split of `complete_dataset` and stored the observations into a training set and test_set respectively. We trained the model using the training set and we will test how our model performs on unseen data with the test set. We will also use five fold cross-validation to tune any hyperparameters.
+
+A bayesian regularized neural network was used to predict bloom_doy based on location, year, chill_hours, accumulative_growing_degree_days, total_sunshine_duration, and total_precipitation. The model with two neurons was chosen as the optimal model due to the low RMSE value achieved during cross-validation.
+
+The test R-squared was approximately 0.884 which indicates that 88.4% of the variation in bloom dates can be explained by our model.
+
+The test RMSE was about 2.7 which indicates that on average the bloom date predictions were off by 2.7 days.
+
+```{r}
+#| message: false
+#| warning: false
+# split data into a training set(70%) and a test set(30%)
+set.seed(123) 
+index <- createDataPartition(y = complete_dataset$bloom_doy,p = .70, list = FALSE)
+training_set <- complete_dataset[index, ]
+test_set <- complete_dataset[-index, ]
+
+
+
+
+
+# model will perform five fold cross-validation five times
+five_fold_cross_validation <- trainControl(method = "repeatedcv", number = 5, repeats = 5) 
+
+```
+
+```{r}
+#| output: false
+
+brnn_model <- train(bloom_doy ~ location + year + chill_hours + 
+                      accumulative_growing_degree_days + total_sunshine_duration + 
+                      total_precipitation, data = training_set, method = "brnn", 
+                      trControl = five_fold_cross_validation)
+```
+
+```{r}
+print(brnn_model)
+
+test_set_predictions <- predict(brnn_model, newdata = test_set)
+
+test_set_performance <- postResample(pred = test_set_predictions, obs = test_set$bloom_doy)
+
+cat("\nTest Set Performance\n")
+test_set_performance
+```
+
+# 2024 Predictions
+
+We used the same technique we used with `complete_dataset` to generate the daily and hourly weather aggregations for 2024 for each location. We then make predictions using our model trained on `complete_dataset` and output our predictions to a csv file. 
+
+```{r}
+
+
+brnn_model_all_data <- train(bloom_doy ~ location + year + chill_hours + 
+                      accumulative_growing_degree_days + total_sunshine_duration + 
+                      total_precipitation, data = complete_dataset, method = "brnn", 
+                      trControl = five_fold_cross_validation)
+
+predictions_2024 <-
+  tibble(
+    location = c("washingtondc", "liestal", "kyoto", "vancouver", "newyorkcity"),
+    year = 2024
+  ) |>
+  rowwise() |>
+  mutate(
+    bloom_date = Sys.Date() + 15,
+    chill_hours = get_chill(location, year),
+    accumulative_growing_degree_days = get_agdd(location, year, bloom_date),
+    total_sunshine_duration = get_sunshine(location, year, bloom_date),
+    total_precipitation = get_precip(location, year, bloom_date)
+  )
+
+predictions_2024 <- predictions_2024 |>
+  dplyr::select(-bloom_date) |>
+  bind_cols(predict(brnn_model_all_data, newdata = predictions_2024)) %>% 
+  rename(prediction = `...7`) |>
+  mutate(prediction = round(prediction)) |>
+  dplyr::select(location, prediction)
+
+  predictions_2024
+```
+
+```{r}
+write.csv(predictions_2024, file = "cherry-predictions.csv", row.names = FALSE)
+```
